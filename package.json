@@ -1,0 +1,44 @@
+{
+  "name": "anthropic-impulse-detector",
+  "version": "2.0.0",
+  "description": "Simulates Claude Code obfuscated geo-profiling functions. Detects mainland Chinese user fingerprints via pure filesystem scanning — no AI, no network.",
+  "main": "index.js",
+  "bin": {
+    "aid": "./index.js",
+    "anthropic-impulse-detector": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "dist/"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "build": "node build.js",
+    "prepublishOnly": "node build.js && echo '✓ Build complete'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anonymous/anthropic-impulse-detector"
+  },
+  "keywords": [
+    "anthropic",
+    "claude-code",
+    "privacy",
+    "geo-profiling",
+    "fingerprint",
+    "detection",
+    "wsl",
+    "china",
+    "reverse-engineering",
+    "obfuscation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "javascript-obfuscator": "^5.4.3"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
