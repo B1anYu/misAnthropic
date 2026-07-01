@@ -1,11 +1,10 @@
 {
-  "name": "anthropic-impulse-detector",
+  "name": "misanthropic",
   "version": "2.0.0",
-  "description": "Simulates Claude Code obfuscated geo-profiling functions. Detects mainland Chinese user fingerprints via pure filesystem scanning — no AI, no network.",
+  "description": "Detects geo-fingerprint signals based on public reverse-engineering research. Pure filesystem scanning — no network, no upload.",
   "main": "index.js",
   "bin": {
-    "aid": "./index.js",
-    "anthropic-impulse-detector": "./index.js"
+    "misanthropic": "./index.js"
   },
   "files": [
     "index.js",
@@ -18,17 +17,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/anonymous/anthropic-impulse-detector"
+    "url": "https://github.com/anonymous/misanthropic"
   },
   "keywords": [
-    "anthropic",
-    "claude-code",
     "privacy",
-    "geo-profiling",
     "fingerprint",
     "detection",
     "wsl",
-    "china",
+    "geo-profiling",
     "reverse-engineering",
     "obfuscation"
   ],

@@ -1,11 +1,8 @@
 #!/usr/bin/env node
-/* Anthropic-Impulse-Detector (AID) — v2.0.0 — WSL Edition
+/* MisAnthropic v2.0.0 — WSL Edition
  *
- * Simulates every programmatic check that Claude Code's obfuscated functions
- * could perform in a WSL2 environment to geo-profile you.
- *
- * All checks are pure fs.readdirSync / fs.readFileSync / process.env — no AI,
- * no network, nothing that couldn't be XOR-obfuscated into a binary.
+ * 检测客户端隐写检查可能依赖的地理指纹信号。
+ * 基于已公开的逆向分析资料，纯文件系统扫描——不联网，不上传。
  *
  * Usage:
  *   node index.js              pretty output
@@ -1399,7 +1396,7 @@ function formatResults(allResults) {
       const p0 = found.filter(c => c.severity === 'P0').length;
       out += `P0(致命):${p0} P1(严重):${found.filter(c=>c.severity==='P1').length} P2:${found.filter(c=>c.severity==='P2').length} P3:${found.filter(c=>c.severity==='P3').length}\n`;
       out += `/mnt/c/: ${MNT_C ? R+'可访问'+X : G+'已禁用'+X}\n`;
-      if (p0 > 0) out += `${R}结论: 极可能已被 Anthropic 标记${X}\n`;
+      if (p0 > 0) out += `${R}结论: 存在被服务端通过客户端隐写识别的地域风险${X}\n`;
     } else {
       out += `${G}${B}未检测到中国大陆指纹${X}\n`;
     }
@@ -1411,9 +1408,9 @@ function formatResults(allResults) {
 
   if (total > 0) {
     out += R + B;
-    out += '╔═════════════════════════════════╗\n';
-    out += '║     ⚠  检 测 到 中 国 人  ⚠     ║\n';
-    out += '╚═════════════════════════════════╝\n';
+    out += '╔═════════════════════════════════════════╗\n';
+    out += '║         ⚠  检 测 到 中 国 人  ⚠         ║\n';
+    out += '╚═════════════════════════════════════════╝\n';
     out += X;
     out += `\n${B}共发现 ${R}${total}${X}${B} 个信号${X}\n\n`;
 
@@ -1429,7 +1426,7 @@ function formatResults(allResults) {
         const sc = c.severity === 'P0' ? R : c.severity === 'P1' ? Y : D;
         out += `  ${sc}[${c.severity}]${X} ${c.evidence}\n`;
         if (c.solution) {
-          out += `  ${D}→ 修复:${X} ${c.solution}\n`;
+          out += `  ${D}→ 建议:${X} ${c.solution}\n`;
         }
         out += '\n';
       }
@@ -1451,35 +1448,24 @@ function formatResults(allResults) {
     const p3 = found.filter(c => c.severity === 'P3').length;
     out += `${B}严重程度:${X} ${R}P0(致命):${p0}${X} ${Y}P1(严重):${p1}${X} ${D}P2:${p2} P3:${p3}${X}\n`;
     out += `${B}/mnt/c/:${X} ${MNT_C ? R + '可访问 ⚠' + X : G + '已禁用 ✓' + X}\n`;
-    out += `\n${D}建议: wsl.conf 中 [automount] enabled=false 可阻断 90%+ 信号源${X}\n`;
+    out += `\n${D}/etc/wsl.conf 中 [automount] enabled=false 可阻断 90%+ 指纹信号源，但会破坏 VS Code Remote WSL 和 /mnt/c/ 交互等各种功能。${X}\n`;
 
     if (p0 > 0) {
-      out += `\n${R}${B}结论: Anthropic 服务端有极大概率已将客户端标记为"中国大陆用户"。${X}\n`;
+      out += `\n${R}${B}结论: 存在被服务端通过客户端隐写手段识别的地域风险。此为基于公开逆向资料的技术推测。${X}\n`;
     }
 
-    out += `\n${D}所有检查均为 fs.readdirSync / fs.readFileSync / process.env 程序化操作，${X}`;
-    out += `${D}无需 AI 推断，可被 XOR-混淆嵌入二进制。${X}\n`;
+    out += `\n${D}所有检查均为 fs.readdirSync / fs.readFileSync / process.env 程序化操作，均可被 XOR-混淆嵌入二进制。${X}\n`;
+    out += `${D}程序不联网，结果不上传。${X}\n`;
 
   } else {
     // ── CLEAN ───────────────────────────────────────────────────────────────
     out += G + B;
-    out += '╔══════════════════════════════════════════════════════════════╗\n';
-    out += '║        ✨  未检测到中国大陆指纹  ✨                        ║\n';
-    out += '╚══════════════════════════════════════════════════════════════╝\n';
+    out += '╔════════════════════════════════════════════╗\n';
+    out += '║        ✨  未检测到中国大陆指纹  ✨        ║\n';
+    out += '╚════════════════════════════════════════════╝\n';
     out += X;
-    out += '\n恭喜！根据 Anthropic 的客户端隐写检查逻辑，你是一个"干净用户"。\n\n';
-    out += '这意味着：\n';
-    out += `  • 系统提示词日期格式: 2026-07-01 (横杠 — 正常)\n`;
-    out += `  • 撇号字符: ASCII U+0027 (标准单引号)\n`;
-    out += `  • Crt() / Rrt() / e0t() 的混淆检查对你无计可施\n`;
-    out += '\n';
-    out += `${B}讽刺的是：${X}\n`;
-    out += 'Anthropic 花了大量工程师时间在二进制里埋 XOR-混淆的隐写代码，\n';
-    out += '只为在用户看不见的系统提示词里改变一个 Unicode 撇号。\n';
-    out += '这种程度的偏执，让人想问：GPU 集群是不是闲着，不如多训几个模型？\n';
-    out += '\n';
-    out += `${D}一个估值千亿的 AI 公司，最引以为豪的隐私保护技术是三比特 Unicode 隐写。${X}\n`;
-    out += `${D}这就是"负责任的 AI"吧。${X}\n`;
+    out += '\n本机未命中任何已知指纹。\n';
+    out += `${D}注意: 以上检测基于已公开的第三方逆向分析资料，不代表任何机构的实际行为。${X}\n`;
     out += '\n';
 
     out += `${B}检测覆盖:${X}\n`;
@@ -1504,7 +1490,7 @@ function formatResults(allResults) {
     }
   }
 
-  out += `${D}平台: ${IS_WSL ? 'WSL2' : 'Linux'} | /mnt/c/: ${MNT_C ? '已挂载' : '未挂载'} | 检测器: AID v2.0.0${X}\n`;
+  out += `${D}平台: ${IS_WSL ? 'WSL2' : 'Linux'} | /mnt/c/: ${MNT_C ? '已挂载' : '未挂载'} | MisAnthropic v2.0.0${X}\n`;
   out += '\n';
   return out;
 }
@@ -1513,7 +1499,7 @@ function formatResults(allResults) {
 
 if (FIX_MODE) {
   console.log(`
-${B}修复指南 — Anthropic-Impulse-Detector${X}
+${B}修复指南 — MisAnthropic v2.0.0${X}
 
 ${B}最快见效的三步:${X}
   1. wsl.conf 禁用 automount:    [automount]\\nenabled=false
