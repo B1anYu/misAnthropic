@@ -2,7 +2,7 @@
 /**
  * MisAnthropic Build Pipeline
  *
- * Produces three artifacts from index.js:
+ * Produces three artifacts from index.js (Windows / WSL / Linux edition):
  *
  *   1. dist/mis.bundle.js    — esbuild bundle, readable but single-file
  *   2. dist/mis.obfuscated.js — javascript-obfuscator heavy transform

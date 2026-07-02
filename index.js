@@ -1,8 +1,13 @@
 #!/usr/bin/env node
-/* MisAnthropic v2.0.0 — WSL Edition
+/* MisAnthropic v2.1.0 — Windows & WSL Edition
  *
  * 检测客户端隐写检查可能依赖的地理指纹信号。
  * 基于已公开的逆向分析资料，纯文件系统扫描——不联网，不上传。
+ *
+ * 支持三种运行环境：
+ *   - Windows 原生 (win32)   直接扫描 C:\Users\…、Program Files、注册表等
+ *   - WSL2                   通过 /mnt/c/ 扫描 Windows 侧
+ *   - 纯 Linux               仅扫描 Linux 侧信号（/mnt/c 不可达时自动降级）
  *
  * Usage:
  *   node index.js              pretty output
@@ -43,7 +48,18 @@ const SILENT = Symbol('silent');
 const DEDUP  = new Set(); // global dedup key set
 
 function sh(cmd, opts = {}) {
-  try { return execSync(cmd, { encoding: 'utf-8', timeout: 3000, ...opts }).trim(); }
+  try {
+    let c = cmd;
+    // On Windows: strip bash-isms (2>/dev/null would create a stray file in
+    // cmd.exe; 2>&1 is unnecessary), and ignore child stderr/stdin. cmd.exe
+    // prints "not recognized" errors to the inherited console even with
+    // stdio 'pipe', so stderr must be explicitly ignored to stay silent.
+    const winOpts = IS_WIN ? { stdio: ['ignore', 'pipe', 'ignore'] } : {};
+    if (IS_WIN) {
+      c = c.replace(/\s2>\/dev\/null/g, '').replace(/\s2>&1\b/g, '');
+    }
+    return execSync(c, { encoding: 'utf-8', timeout: 3000, ...winOpts, ...opts }).trim();
+  }
   catch { return SILENT; }
 }
 
@@ -65,6 +81,30 @@ function readDir(p) {
 function statSize(p) {
   try { return fs.statSync(p).size; }
   catch { return 0; }
+}
+
+/** Bounded recursive walk. Returns all paths (files+dirs) under `root` up to
+ *  `maxDepth` deep that satisfy `predicate(fullPath, stat)`. Cross-platform
+ *  replacement for `find … -maxdepth N -name X`. */
+function walkDir(root, maxDepth, predicate = () => true) {
+  const out = [];
+  if (!exists(root)) return out;
+  const stack = [{ dir: root, depth: 0 }];
+  while (stack.length) {
+    const { dir, depth } = stack.pop();
+    const entries = readDir(dir);
+    if (entries === SILENT) continue;
+    for (const e of entries) {
+      const full = path.join(dir, e);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (predicate(full, st)) out.push(full);
+      if (st.isDirectory() && depth < maxDepth) {
+        stack.push({ dir: full, depth: depth + 1 });
+      }
+    }
+  }
+  return out;
 }
 
 /** Scan a directory for entries matching any of the given strings or regexps. */
@@ -106,27 +146,42 @@ function register(id, label, run) { detectors.push({ id, label, run }); }
 
 // ─── platform detection ─────────────────────────────────────────────────────
 
+const IS_WIN = process.platform === 'win32';
+
 const IS_WSL = (() => {
+  if (IS_WIN) return false;
   const release = readFile('/proc/sys/kernel/osrelease') || '';
   return /microsoft|WSL/i.test(release);
 })();
 
-const MNT_C = (() => {
-  if (!IS_WSL) return false;
-  return exists('/mnt/c/Windows/System32/drivers/etc/hosts');
-})();
+// Windows-side filesystem root:
+//   native Windows → system drive (e.g. C:)
+//   WSL2           → /mnt/c
+//   pure Linux     → /mnt/c (unreachable; MNT_C stays false)
+// Node's fs accepts forward slashes on Windows, so `${WINROOT}/Users/…` works
+// uniformly on all three platforms.
+const WINROOT = IS_WIN ? (process.env.SystemDrive || 'C:') : '/mnt/c';
+
+// Whether the Windows-side filesystem is reachable. On native Windows it always
+// is (it IS the local fs); on WSL it depends on automount; on pure Linux it isn't.
+const MNT_C = IS_WIN ? true
+  : (IS_WSL && exists(`${WINROOT}/Windows/System32/drivers/etc/hosts`));
+
+// Human label for the Windows-side fs in output.
+const WINROOT_LABEL = IS_WIN ? 'Windows 本地' : '/mnt/c/';
 
 let _windowsUsersCache;
 function windowsUsers() {
   if (!MNT_C) return [];
   if (_windowsUsersCache) return _windowsUsersCache;
-  const users = readDir('/mnt/c/Users');
+  const dir = `${WINROOT}/Users`;
+  const users = readDir(dir);
   if (users === SILENT) return (_windowsUsersCache = []);
   _windowsUsersCache = users.filter(u => {
     if (u.startsWith('.') || u === 'desktop.ini') return false;
     if (['Public', 'All Users', 'Default', 'Default User', 'DefaultAppPool', 'defaultuser0'].includes(u)) return false;
     // Only include dirs that have AppData (real user profiles)
-    return exists(`/mnt/c/Users/${u}/AppData`);
+    return exists(`${dir}/${u}/AppData`);
   });
   return _windowsUsersCache;
 }
@@ -139,19 +194,26 @@ register('timezone', '时区与系统区域', () => {
   // Claude Code's Crt() only checks Asia/Shanghai and Asia/Urumqi
   const mainlandTZ = ['Asia/Shanghai', 'Asia/Urumqi', 'Asia/Chongqing',
                        'Asia/Harbin', 'Asia/Kashgar'];
-  const tzFile = readFile('/etc/timezone');
 
-  if (tzFile !== SILENT) {
-    const tz = tzFile.trim();
-    if (mainlandTZ.includes(tz)) {
-      const f = finding(`/etc/timezone = "${tz}" → 中国大陆时区`, 'P1',
-        'sudo timedatectl set-timezone Asia/Singapore');
-      if (f) results.push(f);
-    } else {
-      results.push(clean(`时区: ${tz} (不在中国大陆时区名单)`));
-    }
+  // Cross-platform IANA timezone via Node ICU (works on Windows + Linux).
+  let tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch {}
+  // Fallback: /etc/timezone on Linux/WSL
+  if (!tz) {
+    const tzFile = readFile('/etc/timezone');
+    if (tzFile !== SILENT) tz = tzFile.trim();
+  }
+
+  if (tz && mainlandTZ.includes(tz)) {
+    const f = finding(`系统时区 = "${tz}" → 中国大陆时区`, 'P1',
+      IS_WIN
+        ? '设置 → 时间和语言 → 时区 改为非中国时区 (或管理员: tzutil /s "Singapore Standard Time")'
+        : 'sudo timedatectl set-timezone Asia/Singapore');
+    if (f) results.push(f);
+  } else if (tz) {
+    results.push(clean(`时区: ${tz} (不在中国大陆时区名单)`));
   } else {
-    results.push(clean('无法读取 /etc/timezone'));
+    results.push(clean('无法确定系统时区'));
   }
 
   // TZ env var
@@ -169,35 +231,51 @@ register('timezone', '时区与系统区域', () => {
 register('locale', '语言环境 (Locale)', () => {
   const results = [];
   const lang = process.env.LANG || '';
-  const allLocales = sh('locale 2>/dev/null') || '';
+  let allLocales = '';
+
+  if (IS_WIN) {
+    // Windows: read user locale from registry (e.g. zh-CN).
+    // InstallLanguage=0804 is handled separately in D2.7 — not included here
+    // to avoid duplicate findings.
+    const ln = sh('reg query "HKCU\\Control Panel\\International" /v LocaleName');
+    if (ln !== SILENT) allLocales = ln;
+  } else {
+    allLocales = sh('locale 2>/dev/null') || '';
+  }
 
   // zh_CN / zh-CN 是关键信号。zh_TW/SG 已删除（非大陆，意义弱）；
   // zh_HK/zh-HK 保留但仅 P3（香港区域，弱信号）。
   const cnRe = /zh_CN|zh-CN/i;
   const hkRe = /zh_HK|zh-HK/i;
 
-  if (cnRe.test(lang) || cnRe.test(allLocales)) {
-    const f = finding(`LANG/locale 含 zh_CN (简体中文): ${lang}`,
-      'P1', 'export LANG=en_US.UTF-8; sudo update-locale LANG=en_US.UTF-8');
+  const blob = `${lang}\n${allLocales}`;
+  if (cnRe.test(blob)) {
+    const f = finding(`locale 含 zh_CN/简体中文: ${lang || allLocales.replace(/\s+/g, ' ').trim()}`,
+      'P1', IS_WIN
+        ? '设置 → 时间和语言 → 语言和区域 改为 English (United States)'
+        : 'export LANG=en_US.UTF-8; sudo update-locale LANG=en_US.UTF-8');
     if (f) results.push(f);
-  } else if (hkRe.test(lang) || hkRe.test(allLocales)) {
-    const f = finding(`LANG/locale 含 zh_HK (香港区域): ${lang}`,
-      'P3', '如需完全消除中文痕迹: export LANG=en_US.UTF-8');
+  } else if (hkRe.test(blob)) {
+    const f = finding(`locale 含 zh_HK (香港区域): ${lang || allLocales.replace(/\s+/g, ' ').trim()}`,
+      'P3', IS_WIN
+        ? '设置 → 时间和语言 → 语言和区域 改为 English'
+        : '如需完全消除中文痕迹: export LANG=en_US.UTF-8');
     if (f) results.push(f);
   } else {
-    results.push(clean(`LANG="${lang || '未设置'}" — 非中文区域`));
+    results.push(clean(`locale="${lang || '未设置'}" — 非中文区域`));
   }
 
   return results;
 });
 
-// ─── D2: /mnt/c/ filesystem ─────────────────────────────────────────────────
+// ─── D2: Windows-side filesystem ─────────────────────────────────────────────
+// 原生 Windows 扫描本地盘 (C:\…)；WSL 通过 /mnt/c/ 扫描 Windows 侧。
 
-register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
+register('fs-mnt', `Windows 侧文件系统指纹 (${WINROOT_LABEL})`, () => {
   const results = [];
 
   if (!MNT_C) {
-    results.push(clean('/mnt/c/ 未挂载或不可读 — P0 指纹源已关闭'));
+    results.push(clean(`${WINROOT_LABEL} 不可读 — Windows 侧指纹源已关闭`));
     return results;
   }
 
@@ -265,7 +343,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
     'QQLive', '腾讯视频', 'PPTV', 'PPLive', '风行', 'Funshion',
   ];
   let appHits = [];
-  for (const d of ['/mnt/c/Program Files', '/mnt/c/Program Files (x86)']) {
+  for (const d of [`${WINROOT}/Program Files`, `${WINROOT}/Program Files (x86)`]) {
     for (const h of globMatch(d, ...chineseApps)) appHits.push(`${d.split('/').pop()}/${h}`);
   }
   if (appHits.length > 0) {
@@ -277,7 +355,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
 
   // ── 2.2 Desktop shortcuts（按数量分级） ─────────────────────────────────
   // Public Desktop 下快捷方式名关键词（.lnk 通常不显示后缀，但 globMatch 按包含匹配）
-  const pubDesktop = '/mnt/c/Users/Public/Desktop';
+  const pubDesktop = `${WINROOT}/Users/Public/Desktop`;
   const deskPatterns = [
     /[一-鿿]/,                       // 任何含中文的快捷方式名
     // 腾讯系
@@ -314,7 +392,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
   if (deskHits.length > 0) {
     const { sev, n } = tierByCount(deskHits);
     const f = finding(`Public Desktop ${n} 个中文/国产软件快捷方式: ${deskHits.slice(0, 5).join(', ')}`, sev,
-      `删除 /mnt/c/Users/Public/Desktop/ 下的相关快捷方式`);
+      `删除 ${WINROOT}/Users/Public/Desktop/ 下的相关快捷方式`);
     if (f) results.push(f);
   }
 
@@ -373,7 +451,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
   ];
   let appDataHits = [];
   for (const u of users) {
-    const roaming = `/mnt/c/Users/${u}/AppData/Roaming`;
+    const roaming = `${WINROOT}/Users/${u}/AppData/Roaming`;
     for (const h of globMatch(roaming, ...appDataApps)) {
       appDataHits.push(`AppData\\Roaming\\${h} (用户: ${u})`);
     }
@@ -407,9 +485,21 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
     /^ChinaNet/i,       // 中国电信
     /^ChinaUnicom/i,
   ];
-  const wifiBase = '/mnt/c/ProgramData/Microsoft/Wlansvc/Profiles/Interfaces';
+  // 评估单个 SSID：命中则返回标签，否则 null。
+  function evalSSID(ssid) {
+    const isCNKw = wifiCNKeywords.some(re => re.test(ssid));
+    const isCJK = /[一-鿿]/.test(ssid);
+    if (isCNKw || isCJK) return isCNKw ? '运营商/中国关键词前缀' : '含中文';
+    return null;
+  }
+
   let wifiHits = [];
   const seenSSID = new Set(); // 同一 SSID 可能在多个配置文件/接口下重复，按 SSID 去重
+  // 统一读 Wlansvc 的 WiFi 配置 XML（原生 Windows 走 C:\ProgramData\…，WSL 走 /mnt/c/…）。
+  // 直接读 profile 文件而非 netsh —— netsh 输出的标签随系统语言变化
+  // （中文系统是"所有用户配置文件"而非"All User Profile"），正则匹配不可靠。
+  // XML 文件与界面语言无关，原生 Windows 普通用户亦可读（含全部已保存配置，含已断开的）。
+  const wifiBase = `${WINROOT}/ProgramData/Microsoft/Wlansvc/Profiles/Interfaces`;
   if (exists(wifiBase)) {
     const ifaces = readDir(wifiBase);
     if (ifaces !== SILENT) {
@@ -425,13 +515,8 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
           for (const m of ssidM) {
             const ssid = m.replace(/<\/?name>/g, '');
             if (seenSSID.has(ssid)) continue;
-            const isCNKw = wifiCNKeywords.some(re => re.test(ssid));
-            const isCJK = /[一-鿿]/.test(ssid);
-            if (isCNKw || isCJK) {
-              seenSSID.add(ssid);
-              const tag = isCNKw ? '运营商/中国关键词前缀' : '含中文';
-              wifiHits.push(`"${ssid}" (${tag})`);
-            }
+            const tag = evalSSID(ssid);
+            if (tag) { seenSSID.add(ssid); wifiHits.push(`"${ssid}" (${tag})`); }
           }
         }
       }
@@ -447,7 +532,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
   // ── 2.6 PowerShell history ──────────────────────────────────────────────
   // 把 .edu.cn / 典型中国域名 / 其他裸 .cn 合并成一条 finding，避免对同一份历史文件输出多行
   for (const u of users) {
-    const psPath = `/mnt/c/Users/${u}/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt`;
+    const psPath = `${WINROOT}/Users/${u}/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt`;
     const hist = readFile(psPath);
     if (hist === SILENT) continue;
 
@@ -482,7 +567,7 @@ register('fs-mnt', 'Windows 挂载点指纹 (/mnt/c/)', () => {
   }
 
   // ── 2.7 Registry: InstallLanguage ──────────────────────────────────────
-  // Try to read via reg.exe if /mnt/c is accessible (WSL interop may work even without mount)
+  // 原生 Windows 直接调用 reg.exe；WSL 通过 interop 调用；sh() 会剥离 2>/dev/null。
   const regLang = sh('reg.exe query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Nls\\Language" /v InstallLanguage 2>/dev/null');
   if (regLang !== SILENT && /0804/.test(regLang)) {
     const f = finding('Windows InstallLanguage = 0804 (zh-CN 简体中文)', 'P1',
@@ -621,9 +706,11 @@ register('pkg-managers', '包管理器镜像配置', () => {
       const f = finding(`npm registry = ${reg}`, 'P0', 'npm config set registry https://registry.npmjs.org/');
       if (f) results.push(f);
     }
-    // npm cache
+    // npm cache — cross-platform dir walk (replaces `find … | head`)
     if (exists(path.join(home, '.npm/_cacache'))) {
-      const cacheStr = sh(`find ${home}/.npm/_cacache -maxdepth 3 -type d 2>/dev/null | head -100`) || '';
+      const dirs = walkDir(path.join(home, '.npm/_cacache'), 3,
+        (full, st) => st.isDirectory());
+      const cacheStr = dirs.join('\n');
       if (/npmmirror|taobao|cdn\.npmmirror/i.test(cacheStr)) {
         const f = finding('npm 缓存残留 npmmirror/taobao 域名', 'P1', 'npm cache clean --force');
         if (f) results.push(f);
@@ -646,8 +733,8 @@ register('pkg-managers', '包管理器镜像配置', () => {
     }
   })();
 
-  // apt
-  (() => {
+  // apt — Linux/WSL only
+  if (!IS_WIN) (() => {
     const src = readFile('/etc/apt/sources.list');
     if (src !== SILENT && /mirrors\.(aliyun|tuna|ustc|163|huawei|tencent)/i.test(src)) {
       const f = finding('/etc/apt/sources.list 指向中国镜像', 'P1', '恢复为 archive.ubuntu.com');
@@ -674,10 +761,16 @@ register('pkg-managers', '包管理器镜像配置', () => {
 
   // docker
   (() => {
-    const dj = readFile('/etc/docker/daemon.json');
-    if (dj !== SILENT && /mirror\.aliyuncs|\.cn/i.test(dj)) {
-      const f = finding('/etc/docker/daemon.json 含中国 registry mirror', 'P2', '编辑 /etc/docker/daemon.json');
-      if (f) results.push(f);
+    // Linux: /etc/docker/daemon.json ; Windows: %ProgramData%\docker\config\daemon.json
+    const daemonPaths = IS_WIN
+      ? [`${WINROOT}/ProgramData/docker/config/daemon.json`]
+      : ['/etc/docker/daemon.json'];
+    for (const dp of daemonPaths) {
+      const dj = readFile(dp);
+      if (dj !== SILENT && /mirror\.aliyuncs|\.cn/i.test(dj)) {
+        const f = finding(`${dp} 含中国 registry mirror`, 'P2', `编辑 ${dp}`);
+        if (f) results.push(f);
+      }
     }
     const dc = readFile(path.join(home, '.docker/config.json'));
     if (dc !== SILENT && /\.cn/i.test(dc)) {
@@ -792,16 +885,28 @@ register('network', '网络指纹', () => {
     }
   }
 
-  // DNS
-  const resolv = readFile('/etc/resolv.conf');
-  if (resolv !== SILENT) {
-    const chinaDns = ['114.114.114.114', '114.114.115.115', '223.5.5.5', '223.6.6.6',
-                       '180.76.76.76', '119.29.29.29', '182.254.116.116'];
-    for (const dns of chinaDns) {
-      if (resolv.includes(dns)) {
-        const f = finding(`DNS: ${dns} (中国公共 DNS)`, 'P1', '改用 8.8.8.8');
-        if (f) results.push(f);
-      }
+  // DNS — 命中的中国公共 DNS 合并成一条（避免主备地址各出一条）
+  const chinaDns = [
+    '114.114.114.114', '114.114.115.115', // 114 DNS
+    '223.5.5.5', '223.6.6.6',             // 阿里 DNS
+    '180.76.76.76',                        // 百度 DNS
+    '119.29.29.29',                        // 腾讯 DNSPod
+    '182.254.116.116',                     // 腾讯 DNSPod
+  ];
+  let dnsText = SILENT;
+  if (IS_WIN) {
+    // Windows: netsh 列出各接口的 DNS 服务器。
+    dnsText = sh('netsh interface ip show dns');
+  } else {
+    dnsText = readFile('/etc/resolv.conf');
+  }
+  if (dnsText !== SILENT) {
+    const matched = chinaDns.filter(dns => dnsText.includes(dns));
+    if (matched.length > 0) {
+      const f = finding(`DNS 使用中国公共 DNS: ${matched.join(', ')}`, 'P1',
+        IS_WIN ? '设置 → 网络和 Internet → 适配器属性 → IPv4 DNS 改为 8.8.8.8'
+               : '改用 8.8.8.8');
+      if (f) results.push(f);
     }
   }
 
@@ -815,18 +920,28 @@ register('network', '网络指纹', () => {
 
 register('hardware', '硬件与系统指纹', () => {
   const results = [];
+  const home = os.homedir();
 
-  // DMI（WSL 中通常为空）
+  // ── 厂商 ──────────────────────────────────────────────────────────────
   // 大陆本土品牌（方正/同方/神舟等）= P2；lenovo/huawei/xiaomi 全球销售，降为 P3
-  const sysVendor = readFile('/sys/class/dmi/id/sys_vendor');
-  if (sysVendor !== SILENT) {
+  let sysVendor = '';
+  if (IS_WIN) {
+    // Windows: WMI (CIM) 取厂商。wmic 已弃用，用 PowerShell。
+    const v = sh('powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystem).Manufacturer"');
+    if (v !== SILENT) sysVendor = v;
+  } else {
+    // DMI（WSL 中通常为空）
+    const f = readFile('/sys/class/dmi/id/sys_vendor');
+    if (f !== SILENT) sysVendor = f.trim();
+  }
+  if (sysVendor) {
     const v = sysVendor.trim();
-    if (/founder|tongfang|hasee|hasse/i.test(v)) {
-      const f = finding(`DMI sys_vendor = "${v}" (大陆本土品牌)`, 'P2',
-        'WSL 中 DMI 通常为空；若非空说明运行在物理机或未隔离环境');
+    if (/founder|tongfang|hasee|hasse|hasee|clevo|mechrevo|机械革命|神舟|方正|同方/i.test(v)) {
+      const f = finding(`系统厂商 = "${v}" (大陆本土品牌)`, 'P2',
+        IS_WIN ? '该信号源于固件，无法在不改硬件的情况下消除' : 'WSL 中 DMI 通常为空；若非空说明运行在物理机或未隔离环境');
       if (f) results.push(f);
-    } else if (/lenovo|huawei|xiaomi/i.test(v)) {
-      const f = finding(`DMI sys_vendor = "${v}" (国际销售的中国品牌，地理意义弱)`, 'P3',
+    } else if (/lenovo|huawei|xiaomi|hon[o]?r|redmi/i.test(v)) {
+      const f = finding(`系统厂商 = "${v}" (国际销售的中国品牌，地理意义弱)`, 'P3',
         '该品牌全球销售，不足以判定地域');
       if (f) results.push(f);
     }
@@ -834,64 +949,81 @@ register('hardware', '硬件与系统指纹', () => {
 
   // 中文字体检测已删除 —— Noto CJK 等已非常普遍，无地理意义
 
-  // 输入法：检测具体的中文输入法二进制/配置，而非仅环境变量
-  // fcitx5-pinyin / fcitx5-rime / ibus-pinyin / ibus-rime / sogou 等
-  const home = os.homedir();
-  const imSignals = [];
-  // fcitx5 拼音/双拼/中州韵配置
-  const fcitx5Pinyin = path.join(home, '.local/share/fcitx5/pinyin');
-  const fcitx5Rime = path.join(home, '.local/share/fcitx5/rime');
-  if (exists(fcitx5Pinyin)) imSignals.push('fcitx5 拼音配置 (.local/share/fcitx5/pinyin)');
-  if (exists(fcitx5Rime)) imSignals.push('fcitx5 rime 配置 (.local/share/fcitx5/rime)');
-  // fcitx4 / sogou
-  const fcitx4 = path.join(home, '.config/fcitx/profile');
-  if (fcitx4 && exists(fcitx4)) {
-    const p = readFile(fcitx4);
-    if (p !== SILENT && /pinyin|rime|sogou|sunpinyin|googlepinyin/i.test(p)) {
-      imSignals.push('fcitx 中文输入法配置 (.config/fcitx/profile)');
+  // ── 输入法 / 键盘布局 ─────────────────────────────────────────────────
+  if (IS_WIN) {
+    // Windows: Get-WinUserLanguageList 列出已安装语言/输入法。
+    // 中文输入法 LanguageTag 为 zh-*，或 InputMethodTip 以 0804 (zh-CN) 开头。
+    const langs = sh('powershell -NoProfile -Command "Get-WinUserLanguageList | ForEach-Object { $_.LanguageTag + \'/\' + ($_.InputMethodTips -join \',\') }"');
+    if (langs !== SILENT && /\bzh-/i.test(langs)) {
+      const f = finding(`Windows 已安装中文输入法/语言: ${langs.split('\n').filter(l => /zh-/i.test(l)).join(', ')}`, 'P2',
+        '设置 → 时间和语言 → 语言和区域 → 首选语言，移除中文（如需输入可改用第三方英文界面输入法）');
+      if (f) results.push(f);
     }
-  }
-  // ibus 拼音/中州韵
-  const ibusDir = path.join(home, '.config/ibus');
-  if (exists(ibusDir)) {
-    // 检查是否装了 ibus-pinyin / ibus-rime（dpkg 静默）
-    const dpkg = sh('dpkg -l 2>/dev/null | grep -E "ibus-(pinyin|rime|sunpinyin|table-chinese)"');
-    if (dpkg !== SILENT && dpkg) imSignals.push(`ibus 中文输入法: ${dpkg.split('\n')[0].slice(0, 60)}`);
-  }
-  // Sogou 输入法（Linux 版）
-  const sogouBin = '/usr/lib/x86_64-linux-gnu/sogou';
-  if (exists(sogouBin) || exists('/opt/sogoupinyin')) imSignals.push('搜狗输入法 (Linux)');
-  if (imSignals.length > 0) {
-    const f = finding(`检测到 ${imSignals.length} 个中文输入法: ${imSignals.join(', ')}`, 'P2',
-      '卸载这些输入法: rm -rf 相关配置; unset GTK_IM_MODULE QT_IM_MODULE XMODIFIERS');
-    if (f) results.push(f);
-  }
-
-  // Keyboard layout — localectl 优先，缺失则回退到配置文件
-  // （精简容器里常无 localectl，但布局仍可能配在 /etc/vconsole.conf 或 /etc/default/keyboard）
-  let layoutSignal = null;
-  const lc = sh('localectl 2>/dev/null');
-  if (lc !== SILENT && /X11 Layout:\s*(cn|zh)/i.test(lc)) {
-    layoutSignal = lc.match(/X11 Layout:.*/)?.[0];
+    // 键盘布局含 zh → P3（弱信号，海外华人也常用）
+    if (langs !== SILENT && /\bzh\b/i.test(langs)) {
+      const f = finding(`Windows 键盘布局含中文: ${langs.split('\n')[0].slice(0, 60)}`, 'P3',
+        '设置 → 时间和语言 → 语言 → 中文 → 键盘选项，移除中文布局');
+      if (f) results.push(f);
+    }
   } else {
-    // /etc/vconsole.conf: KEYMAP=... (cn / zh 均为中国布局)
-    const vconsole = readFile('/etc/vconsole.conf');
-    if (vconsole !== SILENT) {
-      const m = vconsole.match(/^\s*KEYMAP=(\S+)/m);
-      if (m && /cn|zh/i.test(m[1])) layoutSignal = `vconsole KEYMAP=${m[1]}`;
-    }
-    // /etc/default/keyboard: XKBLAYOUT="us,cn" 等
-    if (!layoutSignal) {
-      const kb = readFile('/etc/default/keyboard');
-      if (kb !== SILENT) {
-        const m = kb.match(/^\s*XKBLAYOUT=["']?([^"'\n]+)/m);
-        if (m && /\b(cn|zh)\b/i.test(m[1])) layoutSignal = `XKBLAYOUT=${m[1]}`;
+    // 输入法：检测具体的中文输入法二进制/配置，而非仅环境变量
+    // fcitx5-pinyin / fcitx5-rime / ibus-pinyin / ibus-rime / sogou 等
+    const imSignals = [];
+    // fcitx5 拼音/双拼/中州韵配置
+    const fcitx5Pinyin = path.join(home, '.local/share/fcitx5/pinyin');
+    const fcitx5Rime = path.join(home, '.local/share/fcitx5/rime');
+    if (exists(fcitx5Pinyin)) imSignals.push('fcitx5 拼音配置 (.local/share/fcitx5/pinyin)');
+    if (exists(fcitx5Rime)) imSignals.push('fcitx5 rime 配置 (.local/share/fcitx5/rime)');
+    // fcitx4 / sogou
+    const fcitx4 = path.join(home, '.config/fcitx/profile');
+    if (fcitx4 && exists(fcitx4)) {
+      const p = readFile(fcitx4);
+      if (p !== SILENT && /pinyin|rime|sogou|sunpinyin|googlepinyin/i.test(p)) {
+        imSignals.push('fcitx 中文输入法配置 (.config/fcitx/profile)');
       }
     }
-  }
-  if (layoutSignal) {
-    const f = finding(`键盘布局: ${layoutSignal}`, 'P3', 'sudo localectl set-x11-keymap us');
-    if (f) results.push(f);
+    // ibus 拼音/中州韵
+    const ibusDir = path.join(home, '.config/ibus');
+    if (exists(ibusDir)) {
+      // 检查是否装了 ibus-pinyin / ibus-rime（dpkg 静默）
+      const dpkg = sh('dpkg -l 2>/dev/null | grep -E "ibus-(pinyin|rime|sunpinyin|table-chinese)"');
+      if (dpkg !== SILENT && dpkg) imSignals.push(`ibus 中文输入法: ${dpkg.split('\n')[0].slice(0, 60)}`);
+    }
+    // Sogou 输入法（Linux 版）
+    const sogouBin = '/usr/lib/x86_64-linux-gnu/sogou';
+    if (exists(sogouBin) || exists('/opt/sogoupinyin')) imSignals.push('搜狗输入法 (Linux)');
+    if (imSignals.length > 0) {
+      const f = finding(`检测到 ${imSignals.length} 个中文输入法: ${imSignals.join(', ')}`, 'P2',
+        '卸载这些输入法: rm -rf 相关配置; unset GTK_IM_MODULE QT_IM_MODULE XMODIFIERS');
+      if (f) results.push(f);
+    }
+
+    // Keyboard layout — localectl 优先，缺失则回退到配置文件
+    // （精简容器里常无 localectl，但布局仍可能配在 /etc/vconsole.conf 或 /etc/default/keyboard）
+    let layoutSignal = null;
+    const lc = sh('localectl 2>/dev/null');
+    if (lc !== SILENT && /X11 Layout:\s*(cn|zh)/i.test(lc)) {
+      layoutSignal = lc.match(/X11 Layout:.*/)?.[0];
+    } else {
+      // /etc/vconsole.conf: KEYMAP=... (cn / zh 均为中国布局)
+      const vconsole = readFile('/etc/vconsole.conf');
+      if (vconsole !== SILENT) {
+        const m = vconsole.match(/^\s*KEYMAP=(\S+)/m);
+        if (m && /cn|zh/i.test(m[1])) layoutSignal = `vconsole KEYMAP=${m[1]}`;
+      }
+      // /etc/default/keyboard: XKBLAYOUT="us,cn" 等
+      if (!layoutSignal) {
+        const kb = readFile('/etc/default/keyboard');
+        if (kb !== SILENT) {
+          const m = kb.match(/^\s*XKBLAYOUT=["']?([^"'\n]+)/m);
+          if (m && /\b(cn|zh)\b/i.test(m[1])) layoutSignal = `XKBLAYOUT=${m[1]}`;
+        }
+      }
+    }
+    if (layoutSignal) {
+      const f = finding(`键盘布局: ${layoutSignal}`, 'P3', 'sudo localectl set-x11-keymap us');
+      if (f) results.push(f);
+    }
   }
 
   if (results.length === 0) {
@@ -942,14 +1074,23 @@ register('misc', '其他杂项', () => {
   // hostname
   if (/[一-鿿]/.test(os.hostname())) {
     const f = finding(`hostname 含中文: "${os.hostname()}"`, 'P3',
-      'sudo hostnamectl set-hostname <ascii>');
+      IS_WIN ? '管理员 PowerShell: Rename-Computer -NewName <ascii>'
+             : 'sudo hostnamectl set-hostname <ascii>');
     if (f) results.push(f);
   }
 
-  // machine-id
-  const mid = readFile('/etc/machine-id');
-  if (mid !== SILENT) {
-    results.push(clean(`/etc/machine-id: ${mid.trim().slice(0, 12)}... (仅用于跨会话关联)`));
+  // machine-id（仅作信息展示，非地理信号）
+  if (IS_WIN) {
+    const mg = sh('reg.exe query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid 2>/dev/null');
+    if (mg !== SILENT) {
+      const m = mg.match(/MachineGuid\s+REG_SZ\s+([0-9a-f-]+)/i);
+      if (m) results.push(clean(`MachineGuid: ${m[1]} (仅用于跨会话关联)`));
+    }
+  } else {
+    const mid = readFile('/etc/machine-id');
+    if (mid !== SILENT) {
+      results.push(clean(`/etc/machine-id: ${mid.trim().slice(0, 12)}... (仅用于跨会话关联)`));
+    }
   }
 
   // git email domain
@@ -1066,9 +1207,9 @@ register('cc-switch', 'CC Switch (AI 工具管理器)', () => {
   // ── Scan each Windows user ──────────────────────────────────────────────
 
   for (const user of users) {
-    const ccExe = `/mnt/c/Users/${user}/AppData/Local/Programs/CC Switch/cc-switch.exe`;
-    const ccDb  = `/mnt/c/Users/${user}/.cc-switch/cc-switch.db`;
-    const ccSet = `/mnt/c/Users/${user}/.cc-switch/settings.json`;
+    const ccExe = `${WINROOT}/Users/${user}/AppData/Local/Programs/CC Switch/cc-switch.exe`;
+    const ccDb  = `${WINROOT}/Users/${user}/.cc-switch/cc-switch.db`;
+    const ccSet = `${WINROOT}/Users/${user}/.cc-switch/settings.json`;
 
     // ── 9.1 Installation (P2 — just having the app isn't proof) ─────────
 
@@ -1135,7 +1276,7 @@ register('cc-switch', 'CC Switch (AI 工具管理器)', () => {
   if (cnProviders.length > 0) {
     const list = cnProviders.slice(0, 6).join(' | ') + (cnProviders.length > 6 ? ' …' : '');
     const f = finding(`CC Switch 配置了 ${cnProviders.length} 个指向中国后端的提供商: ${list}`,
-      'P0', '卸载 CC Switch，从 cc-switch.db 删除这些提供商，改用 Claude Code settings.json 直连官方 API');
+      'P0', '从 cc-switch 删除这些提供商，改用 Claude Code settings.json 直连官方 API');
     if (f) results.push(f);
   }
 
@@ -1189,11 +1330,13 @@ register('axonhub', 'AxonHub (AI 代理网关)', () => {
     path.join(home, '.local/bin/axonhub'),
     '/opt/axonhub/axonhub',
     '/usr/bin/axonhub',
-    // Windows (via /mnt/c/)
+    // Windows 侧（原生 Windows 本地盘 或 WSL /mnt/c）
     ...(MNT_C ? (() => {
       const firstUser = windowsUsers()[0];
-      const paths = ['/mnt/c/axonhub.exe'];
-      if (firstUser) paths.unshift(`/mnt/c/Users/${firstUser}/axonhub.exe`);
+      const paths = [`${WINROOT}/axonhub.exe`];
+      if (firstUser) paths.unshift(`${WINROOT}/Users/${firstUser}/axonhub.exe`);
+      // 原生 Windows 还可能放在用户目录或 Program Files
+      if (IS_WIN) paths.push(path.join(home, 'axonhub.exe'));
       return paths;
     })() : []),
   ];
@@ -1223,14 +1366,12 @@ register('axonhub', 'AxonHub (AI 代理网关)', () => {
       break;
     }
   }
-  // Also search home directory recursively (shallow, max depth 3)
-  const findDb = sh(`find ${home} -maxdepth 3 -name "axonhub.db" 2>/dev/null`);
-  if (findDb !== SILENT && findDb) {
-    for (const p of findDb.split('\n').filter(Boolean)) {
-      if (!dbPaths.includes(p)) {
-        const f = finding(`AxonHub 数据库: ${p}`, 'P2', `删除 ${p}`);
-        if (f) results.push(f);
-      }
+  // Also search home directory recursively (shallow, max depth 3) — cross-platform
+  const foundDb = walkDir(home, 3, (full, st) => !st.isDirectory() && /axonhub\.db$/i.test(full));
+  for (const p of foundDb) {
+    if (!dbPaths.includes(p)) {
+      const f = finding(`AxonHub 数据库: ${p}`, 'P2', `删除 ${p}`);
+      if (f) results.push(f);
     }
   }
 
@@ -1269,24 +1410,33 @@ register('axonhub', 'AxonHub (AI 代理网关)', () => {
   }
 
   // 10.7 Docker（镜像存在即安装特征；不再单独查"运行中容器"——与镜像重复）
-  const dockerImg = sh('docker images 2>/dev/null | grep axonhub');
-  if (dockerImg !== SILENT && dockerImg) {
-    const f = finding(`AxonHub Docker 镜像存在: ${dockerImg.slice(0, 100)}`, 'P2',
-      'docker rmi <image>');
-    if (f) results.push(f);
+  // docker images 在 Windows/Linux 均可用；用 JS 过滤替代 `| grep`（cmd.exe 无 grep）。
+  const dockerImg = sh('docker images');
+  if (dockerImg !== SILENT) {
+    const hit = dockerImg.split('\n').find(l => /axonhub/i.test(l));
+    if (hit) {
+      const f = finding(`AxonHub Docker 镜像存在: ${hit.trim().slice(0, 100)}`, 'P2',
+        'docker rmi <image>');
+      if (f) results.push(f);
+    }
   }
 
-  // 10.8 systemd service
-  const systemd = sh('systemctl list-units --type=service 2>/dev/null | grep axonhub');
-  if (systemd !== SILENT && systemd) {
-    const f = finding('AxonHub systemd 服务已注册', 'P2',
-      'sudo systemctl disable --now axonhub');
-    if (f) results.push(f);
+  // 10.8 systemd service — Linux only
+  if (!IS_WIN) {
+    const systemd = sh('systemctl list-units --type=service');
+    if (systemd !== SILENT) {
+      const hit = systemd.split('\n').find(l => /axonhub/i.test(l));
+      if (hit) {
+        const f = finding('AxonHub systemd 服务已注册', 'P2',
+          'sudo systemctl disable --now axonhub');
+        if (f) results.push(f);
+      }
+    }
   }
 
   // 10.9 npm @axhub/genie (Web UI for AxonHub)
-  const npmAxon = sh('npm list -g 2>/dev/null | grep @axhub/genie');
-  if (npmAxon !== SILENT && npmAxon) {
+  const npmAxon = sh('npm list -g');
+  if (npmAxon !== SILENT && /@axhub\/genie/i.test(npmAxon)) {
     const f = finding('npm 已安装 @axhub/genie (AxonHub Web UI)', 'P2',
       'npm uninstall -g @axhub/genie');
     if (f) results.push(f);
@@ -1301,11 +1451,14 @@ register('axonhub', 'AxonHub (AI 代理网关)', () => {
   }
 
   // 10.11 Check for AxonHub Helm release (K8s)
-  const helmList = sh('helm list 2>/dev/null | grep axonhub');
-  if (helmList !== SILENT && helmList) {
-    const f = finding('Kubernetes 中部署了 AxonHub (Helm release)', 'P2',
-      'helm uninstall axonhub');
-    if (f) results.push(f);
+  const helmList = sh('helm list');
+  if (helmList !== SILENT) {
+    const hit = helmList.split('\n').find(l => /axonhub/i.test(l));
+    if (hit) {
+      const f = finding('Kubernetes 中部署了 AxonHub (Helm release)', 'P2',
+        'helm uninstall axonhub');
+      if (f) results.push(f);
+    }
   }
 
   if (results.filter(r => r.found).length === 0) {
@@ -1339,6 +1492,10 @@ register('wsl-signals', 'WSL 特有信号', () => {
     if (exists('/usr/lib/wsl/lib/nvidia-smi')) {
       results.push(clean('NVIDIA GPU passthrough 可用 (非地理信号，仅硬件信息)'));
     }
+  } else if (IS_WIN) {
+    results.push(clean('原生 Windows 环境 — WSL 专项检查不适用'));
+  } else {
+    results.push(clean('纯 Linux 环境 — WSL 专项检查不适用'));
   }
 
   return results;
@@ -1366,8 +1523,8 @@ function formatResults(allResults) {
     const flat = allResults.flatMap(r => r.checks).filter(c => c.found);
     return JSON.stringify({
       verdict: flat.length > 0 ? 'CHINESE_DETECTED' : 'CLEAN',
-      platform: IS_WSL ? 'wsl2' : 'linux',
-      mntAccessible: MNT_C,
+      platform: IS_WIN ? 'windows' : IS_WSL ? 'wsl2' : 'linux',
+      winRootAccessible: MNT_C,
       totalSignals: flat.length,
       bySeverity: {
         P0: flat.filter(c => c.severity === 'P0').length,
@@ -1395,7 +1552,8 @@ function formatResults(allResults) {
       out += `${R}${B}检测到中国人 — ${total} 个信号${X}\n`;
       const p0 = found.filter(c => c.severity === 'P0').length;
       out += `P0(致命):${p0} P1(严重):${found.filter(c=>c.severity==='P1').length} P2:${found.filter(c=>c.severity==='P2').length} P3:${found.filter(c=>c.severity==='P3').length}\n`;
-      out += `/mnt/c/: ${MNT_C ? R+'可访问'+X : G+'已禁用'+X}\n`;
+      // /mnt/c 可达性只在 WSL/Linux 下有意义；原生 Windows 本地盘恒可读，不显示
+      if (!IS_WIN) out += `${WINROOT_LABEL}: ${MNT_C ? R+'可访问'+X : G+'已禁用'+X}\n`;
       if (p0 > 0) out += `${R}结论: 存在被服务端通过客户端隐写识别的地域风险${X}\n`;
     } else {
       out += `${G}${B}未检测到中国大陆指纹${X}\n`;
@@ -1447,8 +1605,11 @@ function formatResults(allResults) {
     const p2 = found.filter(c => c.severity === 'P2').length;
     const p3 = found.filter(c => c.severity === 'P3').length;
     out += `${B}严重程度:${X} ${R}P0(致命):${p0}${X} ${Y}P1(严重):${p1}${X} ${D}P2:${p2} P3:${p3}${X}\n`;
-    out += `${B}/mnt/c/:${X} ${MNT_C ? R + '可访问 ⚠' + X : G + '已禁用 ✓' + X}\n`;
-    out += `\n${D}/etc/wsl.conf 中 [automount] enabled=false 可阻断 90%+ 指纹信号源，但会破坏 VS Code Remote WSL 和 /mnt/c/ 交互等各种功能。${X}\n`;
+    // /mnt/c 可达性提示只在 WSL/Linux 下有意义；原生 Windows 本地盘恒可读，不显示这行与相关说明
+    if (!IS_WIN) {
+      out += `${B}${WINROOT_LABEL}:${X} ${MNT_C ? R + '可访问 ⚠' + X : G + '已禁用 ✓' + X}\n`;
+      out += `\n${D}/etc/wsl.conf 中 [automount] enabled=false 可阻断 90%+ 指纹信号源，但会破坏 VS Code Remote WSL 和 /mnt/c/ 交互等各种功能。${X}\n`;
+    }
 
     if (p0 > 0) {
       out += `\n${R}${B}结论: 存在被服务端通过客户端隐写手段识别的地域风险。此为基于公开逆向资料的技术推测。${X}\n`;
@@ -1490,7 +1651,7 @@ function formatResults(allResults) {
     }
   }
 
-  out += `${D}平台: ${IS_WSL ? 'WSL2' : 'Linux'} | /mnt/c/: ${MNT_C ? '已挂载' : '未挂载'} | MisAnthropic v2.0.0${X}\n`;
+  out += `${D}平台: ${IS_WIN ? 'Windows' : IS_WSL ? 'WSL2' : 'Linux'}${IS_WIN ? '' : ` | ${WINROOT_LABEL}: ${MNT_C ? '可读' : '不可读'}`} | MisAnthropic v2.1.0${X}\n`;
   out += '\n';
   return out;
 }
@@ -1498,8 +1659,33 @@ function formatResults(allResults) {
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 if (FIX_MODE) {
-  console.log(`
-${B}修复指南 — MisAnthropic v2.0.0${X}
+  if (IS_WIN) {
+    console.log(`
+${B}修复指南 — MisAnthropic v2.1.0 (Windows)${X}
+
+${B}最快见效的三步:${X}
+  1. 时区改为非中国:    设置 → 时间和语言 → 时区  (或管理员: tzutil /s "Singapore Standard Time")
+  2. 清理 PowerShell 历史:  Remove-Item "$env:APPDATA\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"
+  3. 系统区域改为英文:    设置 → 时间和语言 → 语言和区域 → 首选语言设为 English (United States)
+
+${B}包管理器:${X}
+  npm config set registry https://registry.npmjs.org/
+  npm cache clean --force
+  检查 %USERPROFILE%\\.pip\\pip.ini  %USERPROFILE%\\.cargo\\config.toml  %USERPROFILE%\\.docker\\config.json
+  检查 %PROGRAMDATA%\\docker\\config\\daemon.json
+
+${B}Windows 侧痕迹:${X}
+  删除 WiFi 历史:        netsh wlan delete profile name="<SSID>"  (或 删除 C:\\ProgramData\\Microsoft\\Wlansvc\\Profiles\\Interfaces\\ 下的 XML)
+  删除 Public Desktop 中文快捷方式:  C:\\Users\\Public\\Desktop\\
+  卸载 CC Switch 并删除:  C:\\Users\\<user>\\.cc-switch\\
+  移除中文输入法:        设置 → 时间和语言 → 语言和区域 → 首选语言
+
+${B}Claude Code:${X}
+  编辑 %USERPROFILE%\\.claude\\settings.json，将 ANTHROPIC_BASE_URL 改为官方 API
+`);
+  } else {
+    console.log(`
+${B}修复指南 — MisAnthropic v2.1.0 (WSL/Linux)${X}
 
 ${B}最快见效的三步:${X}
   1. wsl.conf 禁用 automount:    [automount]\\nenabled=false
@@ -1518,6 +1704,7 @@ ${B}Windows 端: (如果曾挂载 /mnt/c/)${X}
   删除 Public Desktop 中文快捷方式
   卸载 CC Switch 并删除 C:\\Users\\<user>\\.cc-switch\\
 `);
+  }
   process.exit(0);
 }
 

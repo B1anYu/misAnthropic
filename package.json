@@ -1,7 +1,7 @@
 {
   "name": "misanthropic",
-  "version": "2.0.0",
-  "description": "Detects geo-fingerprint signals based on public reverse-engineering research. Pure filesystem scanning — no network, no upload.",
+  "version": "2.1.0",
+  "description": "Detects geo-fingerprint signals based on public reverse-engineering research. Pure filesystem scanning — no network, no upload. Runs natively on Windows, WSL2, and Linux.",
   "main": "index.js",
   "bin": {
     "misanthropic": "./index.js"
@@ -23,6 +23,7 @@
     "privacy",
     "fingerprint",
     "detection",
+    "windows",
     "wsl",
     "geo-profiling",
     "reverse-engineering",
