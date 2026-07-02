@@ -88,4 +88,4 @@ node index.js --demo-clean  # 无条件预览"干净用户"界面
 
 ## 许可
 
-MIT
+AGPL-3.0 license
