@@ -150,7 +150,8 @@ const IS_WIN = process.platform === 'win32';
 
 const IS_WSL = (() => {
   if (IS_WIN) return false;
-  const release = readFile('/proc/sys/kernel/osrelease') || '';
+  const release = readFile('/proc/sys/kernel/osrelease');
+  if (release === SILENT) return false;
   return /microsoft|WSL/i.test(release);
 })();
 
@@ -795,7 +796,10 @@ register('pkg-managers', '包管理器镜像配置', () => {
 
   // rust/cargo
   (() => {
-    const cc = readFile(path.join(home, '.cargo/config.toml')) || readFile(path.join(home, '.cargo/config'));
+    let cc = readFile(path.join(home, '.cargo/config.toml'));
+    if (cc === SILENT) {
+      cc = readFile(path.join(home, '.cargo/config'));
+    }
     if (cc !== SILENT && /ustc|tuna|aliyun|\.cn/i.test(cc)) {
       const f = finding('~/.cargo/config.toml 含中国镜像', 'P2', '编辑 ~/.cargo/config.toml');
       if (f) results.push(f);
