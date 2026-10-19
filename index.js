@@ -150,8 +150,10 @@ const IS_WIN = process.platform === 'win32';
 
 const IS_WSL = (() => {
   if (IS_WIN) return false;
-  const release = readFile('/proc/sys/kernel/osrelease') || '';
-  return /microsoft|WSL/i.test(release);
+  const release = readFile('/proc/sys/kernel/osrelease');
+  // SILENT (a Symbol) means the file is unreadable (e.g. macOS has no procfs)
+  // — treat as "not WSL" instead of letting `|| ''` pass the Symbol through.
+  return release !== SILENT && /microsoft|WSL/i.test(release);
 })();
 
 // Windows-side filesystem root:
@@ -240,7 +242,8 @@ register('locale', '语言环境 (Locale)', () => {
     const ln = sh('reg query "HKCU\\Control Panel\\International" /v LocaleName');
     if (ln !== SILENT) allLocales = ln;
   } else {
-    allLocales = sh('locale 2>/dev/null') || '';
+    const loc = sh('locale 2>/dev/null');
+    allLocales = loc === SILENT ? '' : loc;
   }
 
   // zh_CN / zh-CN 是关键信号。zh_TW/SG 已删除（非大陆，意义弱）；
